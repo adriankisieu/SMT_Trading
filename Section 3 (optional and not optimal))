@@ -1,6 +1,7 @@
-"""Optional Yahoo historical signal feed. NOT for real-time trading."""
-"""This was optimal in the earlier testing but is no longer optimal. DataBento is the main source of data"""
-import pandas as pd
+"""Optional Yahoo Finance historical data feed, used during early strategy development.
+Databento is now the primary data source for backtesting.
+Not intended for real-time trading.
+"""
 
 
 def fetch_yahoo(cfg: Config = CONFIG, days: int = 45) -> tuple[pd.DataFrame, pd.DataFrame]:
