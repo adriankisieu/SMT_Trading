@@ -1,0 +1,252 @@
+"""SMT signal detection, confirmation, and paper-order planning.
+
+NO trades are executed and NO historical P&L is calculated in this module.
+All signal inputs are 5-minute CLOSED OHLC bars (timestamped at bar OPEN).
+No future observations are used in signal detection.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+
+
+
+@dataclass(frozen=True)
+class Signal:
+    time: pd.Timestamp
+    side: str                      # SHORT after higher high, LONG after lower low
+    leader: str                    # "ES" or "NQ"
+    lagger: str
+    divergence: float
+    correlation: float
+    relative_trend_z: float
+    lagger_reference: float
+    extreme: float                 # high for SHORT / low for LONG
+
+
+@dataclass(frozen=True)
+class Confirmation:
+    time: pd.Timestamp
+    signal: Signal
+    stop_level: float
+    entry_instruction: str = "Next 5-minute candle OPEN (paper only)"
+
+
+@dataclass(frozen=True)
+class PaperOrderPlan:
+    """Not submitted anywhere; calculate once a future bar actually opens."""
+    time: pd.Timestamp
+    instrument: str               # MES for ES or MNQ for NQ
+    side: str
+    entry: float
+    stop: float
+    target: float
+    contracts: int
+    planned_dollar_risk: float
+
+
+def _validate_frame(frame: pd.DataFrame, name: str) -> pd.DataFrame:
+    required = {"open", "high", "low", "close"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"{name}: missing required columns {sorted(missing)}")
+    if not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
+        raise ValueError(f"{name}: bar timestamps must be timezone-aware")
+    if frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
+        raise ValueError(f"{name}: timestamps must be unique and increasing")
+    frame = frame.loc[:, ["open", "high", "low", "close"]].astype(float)
+    if frame.isna().any().any() or (frame <= 0).any().any():
+        raise ValueError(f"{name}: missing/nonpositive OHLC prices")
+    if ((frame.high < frame.low) | (frame.high < frame.open) | (frame.high < frame.close)
+            | (frame.low > frame.open) | (frame.low > frame.close)).any():
+        raise ValueError(f"{name}: inconsistent OHLC bars")
+    return frame.tz_convert("America/New_York")
+
+
+def prepare_data(es: pd.DataFrame, nq: pd.DataFrame, cfg: Config = CONFIG) -> pd.DataFrame:
+    """Align independent ES/NQ OHLC frames and build lagged market features.
+
+    No OHLC gaps are forward filled. A day boundary/gap does not create a 5-min return.
+    """
+    es = _validate_frame(es, "ES")
+    nq = _validate_frame(nq, "NQ")
+    if cfg.regular_session_only:
+        for_name = lambda f: f.between_time("09:30", "15:55", inclusive="both")
+        es, nq = for_name(es), for_name(nq)
+    df = es.add_prefix("es_").join(nq.add_prefix("nq_"), how="inner").dropna()
+    if df.empty:
+        raise ValueError("No common ES/NQ timestamps")
+
+    time_step = pd.Timedelta(minutes=5)
+    same_day = pd.Series(df.index.date, index=df.index).eq(
+        pd.Series(df.index.date, index=df.index).shift(1))
+    consecutive = df.index.to_series().diff().eq(time_step) & same_day
+
+    for asset in ("es", "nq"):
+        df[f"{asset}_ret"] = df[f"{asset}_close"].pct_change().where(consecutive)
+        # Reference levels are from PRIOR candles of the SAME session.
+        highs = df[f"{asset}_high"]
+        lows = df[f"{asset}_low"]
+        days = pd.Series(df.index.date, index=df.index)
+        df[f"{asset}_ref_high"] = highs.groupby(days).transform(
+            lambda s: s.shift(1).rolling(cfg.previous_high_low_bars,
+                                           min_periods=cfg.previous_high_low_bars).max())
+        df[f"{asset}_ref_low"] = lows.groupby(days).transform(
+            lambda s: s.shift(1).rolling(cfg.previous_high_low_bars,
+                                           min_periods=cfg.previous_high_low_bars).min())
+        # Forbid a 30-minute reference containing a missing intermediate bar.
+        prev_times = df.index.to_series().groupby(days).shift(cfg.previous_high_low_bars)
+        valid_window = (df.index.to_series() - prev_times).eq(
+            pd.Timedelta(minutes=5 * cfg.previous_high_low_bars))
+        df.loc[~valid_window, [f"{asset}_ref_high", f"{asset}_ref_low"]] = np.nan
+
+    # 20-session rolling feature estimates are shifted one candle, so that a
+    # current bar's signals cannot determine their own calibration.
+    length = cfg.relationship_days * cfg.bars_per_day
+    min_points = max(20, length - cfg.relationship_days - 5)
+    er, nr = df.es_ret, df.nq_ret
+    roll_e = er.rolling(length, min_periods=min_points)
+    roll_n = nr.rolling(length, min_periods=min_points)
+    df["corr"] = roll_e.corr(nr).shift(1)
+    df["es_vol"] = roll_e.std().shift(1)
+    df["nq_vol"] = roll_n.std().shift(1)
+    cov = roll_e.cov(nr).shift(1)
+    var_n = roll_n.var().shift(1)
+    beta = cov / var_n.replace(0, np.nan)
+    df["beta"] = beta
+    residual_var = df.es_vol.pow(2) + beta.pow(2) * df.nq_vol.pow(2) - 2 * beta * cov
+    residual_sigma = np.sqrt(residual_var.clip(lower=0)).replace(0, np.nan)
+    look = cfg.relative_trend_days * cfg.bars_per_day
+    min_recent = max(10, look - cfg.relative_trend_days - 2)
+    e_sum = er.rolling(look, min_periods=min_recent).sum().shift(1)
+    n_sum = nr.rolling(look, min_periods=min_recent).sum().shift(1)
+    # Under an independent-return approximation, units of trailing 5-day drift.
+    df["relative_trend_z"] = (e_sum - beta * n_sum) / (residual_sigma * np.sqrt(look))
+    return df
+
+
+def _candidate(t: pd.Timestamp, row: pd.Series, cfg: Config) -> Optional[Signal]:
+    important = ["corr", "es_vol", "nq_vol", "relative_trend_z",
+                 "es_ref_high", "nq_ref_high", "es_ref_low", "nq_ref_low"]
+    if not np.isfinite(row[important].astype(float).to_numpy()).all():
+        return None
+    if row["corr"] < cfg.correlation_floor or abs(row["relative_trend_z"]) > cfg.relative_trend_max_z:
+        return None
+    es_sigma = row["es_vol"] * row["es_close"]
+    nq_sigma = row["nq_vol"] * row["nq_close"]
+    if es_sigma <= 0 or nq_sigma <= 0:
+        return None
+
+    for side, kind, polarity in (("SHORT", "high", 1), ("LONG", "low", -1)):
+        for leader, lagger, leader_sigma, lagger_sigma in (
+            ("es", "nq", es_sigma, nq_sigma),
+            ("nq", "es", nq_sigma, es_sigma),
+        ):
+            # SHORT: high minus old high; LONG: old low minus low.
+            leader_delta = polarity * (row[f"{leader}_{kind}"] - row[f"{leader}_ref_{kind}"])
+            lagger_delta = polarity * (row[f"{lagger}_{kind}"] - row[f"{lagger}_ref_{kind}"])
+            if leader_delta < cfg.min_leader_breakout * leader_sigma or lagger_delta >= 0:
+                continue
+            divergence = leader_delta / leader_sigma - lagger_delta / lagger_sigma
+            if divergence < cfg.divergence_min:
+                continue
+            return Signal(time=t, side=side, leader=leader.upper(), lagger=lagger.upper(),
+                          divergence=round(float(divergence), 4),
+                          correlation=round(float(row["corr"]), 4),
+                          relative_trend_z=round(float(row["relative_trend_z"]), 4),
+                          lagger_reference=float(row[f"{lagger}_ref_{kind}"]),
+                          extreme=float(row[f"{leader}_{kind}"]))
+    return None
+
+
+def scan_signals(df: pd.DataFrame, cfg: Config = CONFIG) -> tuple[list[Signal], list[Confirmation]]:
+    """Scan closed bars sequentially; NO fills, trades, or performance calculation.
+
+    A pending SMT setup expires after three confirmation candles, or immediately
+    if the lagging asset reaches the reference high/low after the original signal.
+    """
+    candidates: list[Signal] = []
+    confirmations: list[Confirmation] = []
+    pending: Optional[Signal] = None
+    extreme: float = np.nan
+    pending_age = 0
+    prev_time: Optional[pd.Timestamp] = None
+    prev_row: Optional[pd.Series] = None
+    step = pd.Timedelta(minutes=5)
+
+    for timestamp, row in df.iterrows():
+        just_confirmed = False
+        # A pending setup is valid only within the same continuous trading session.
+        same_session = (prev_time is not None and timestamp - prev_time == step
+                        and timestamp.date() == prev_time.date())
+        if pending is not None and not same_session:
+            pending = None
+
+        if pending is not None and prev_row is not None:
+            pending_age += 1
+            leader = pending.leader.lower()
+            lagger = pending.lagger.lower()
+            if pending.side == "SHORT":
+                extreme = max(extreme, float(row[f"{leader}_high"]))
+                caught_up = row[f"{lagger}_high"] >= pending.lagger_reference
+                confirmed = row[f"{leader}_close"] < prev_row[f"{leader}_low"]
+                stop = extreme + cfg.stop_buffer_ticks * 0.25
+            else:
+                extreme = min(extreme, float(row[f"{leader}_low"]))
+                caught_up = row[f"{lagger}_low"] <= pending.lagger_reference
+                confirmed = row[f"{leader}_close"] > prev_row[f"{leader}_high"]
+                stop = extreme - cfg.stop_buffer_ticks * 0.25
+            # 15:55 bar cannot confirm: the next bar is outside our session.
+            next_bar_in_session = timestamp.time() < pd.Timestamp("15:55").time()
+            if not caught_up and confirmed and next_bar_in_session:
+                confirmations.append(Confirmation(timestamp, pending, float(stop)))
+                just_confirmed = True
+                pending = None
+            elif caught_up or pending_age >= cfg.confirmation_bars:
+                pending = None
+
+        # No overlapping signals while waiting for confirmation.
+        if pending is None and not just_confirmed and not (prev_row is not None and not same_session):
+            signal = _candidate(timestamp, row, cfg)
+            if signal is not None:
+                candidates.append(signal)
+                pending = signal
+                extreme = signal.extreme
+                pending_age = 0
+
+        prev_time = timestamp
+        prev_row = row
+    return candidates, confirmations
+
+
+def make_paper_order_plan(confirmation: Confirmation, next_candle_open: float,
+                          cfg: Config = CONFIG) -> Optional[PaperOrderPlan]:
+    """Optional next-stage helper; does NOT place an order or calculate P&L.
+
+    Intended for use when a NEXT candle has actually begun. This is not called
+    by the signal scanner. Quantities use MICRO future contract multipliers.
+    """
+    if next_candle_open <= 0:
+        raise ValueError("Positive next-candle opening price required")
+    risk_points = ((confirmation.stop_level - next_candle_open)
+                   if confirmation.signal.side == "SHORT"
+                   else (next_candle_open - confirmation.stop_level))
+    if risk_points <= 0:
+        return None
+    instrument, multiplier = (("MES", 5.0) if confirmation.signal.leader == "ES"
+                              else ("MNQ", 2.0))
+    maximum_risk = cfg.initial_paper_equity * cfg.paper_risk_fraction
+    contracts = min(cfg.max_micro_contracts, int(maximum_risk // (risk_points * multiplier)))
+    if contracts < 1:
+        return None
+    target = (next_candle_open - cfg.reward_risk * risk_points
+              if confirmation.signal.side == "SHORT"
+              else next_candle_open + cfg.reward_risk * risk_points)
+    return PaperOrderPlan(time=confirmation.time, instrument=instrument,
+                          side=confirmation.signal.side, entry=next_candle_open,
+                          stop=confirmation.stop_level, target=target,
+                          contracts=contracts,
+                          planned_dollar_risk=contracts * risk_points * multiplier)
