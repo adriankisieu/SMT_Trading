@@ -1,0 +1,467 @@
+
+# =======================================================
+# SECTION 9 — PORTFOLIO-AWARE 1-MINUTE BACKTEST
+# Historical simulation only. No real orders.
+# =======================================================
+
+from collections import defaultdict
+import pandas as pd
+import numpy as np
+
+ORDER_DELAY_MINUTES = 1
+ENTRY_SLIPPAGE_TICKS = 1
+EXIT_SLIPPAGE_TICKS = 1
+ASSUMED_SPREAD_TICKS = 1
+COMMISSION_PER_SIDE = 2.00
+
+# Margin is shared by all simultaneously open trades.
+MAX_MARGIN_UTILIZATION = 0.50
+
+# BACKTEST ASSUMPTION ONLY, not verified IBKR historical margin.
+# Estimated initial margin per micro = 10% of its futures notional value.
+# Replace with broker-confirmed margin requirements when available.
+ESTIMATED_INITIAL_MARGIN_RATE = 0.10
+
+
+# -------------------------------------------------------
+# 9A — DATA SOURCE
+# -------------------------------------------------------
+# Use saved_prices loaded from Databento in Section 6.
+# No Yahoo download or live broker connection in this section.
+
+
+# -------------------------------------------------------
+# 9B — SIMULATE ORDER EXECUTION AND POSITION EXITS
+# -------------------------------------------------------
+
+def simulate_market_order(signal, bars, equity, available_margin):
+    """Size by the tighter of 2%-style configured risk or free margin."""
+
+    symbol = signal["leader"]
+    side = signal["side"]
+    tick = TICK_SIZE[symbol]
+    mult = MICRO_MULTIPLIER[symbol]
+    direction = 1 if side == "LONG" else -1
+    stop = signal["stop"]
+
+    # Submit after confirmation closes, then model order delay.
+    submitted = signal["confirmation"] + pd.Timedelta(minutes=5)
+    filled_at = submitted + pd.Timedelta(minutes=ORDER_DELAY_MINUTES)
+
+    if not (
+        pd.Timestamp("09:30").time()
+        <= filled_at.time()
+        <= pd.Timestamp("15:30").time()
+    ):
+        return None, "outside allowed entry hours"
+
+    # Require the complete 30-minute observation window.
+    n = CONFIG.max_holding_bars * 5
+    times = pd.date_range(filled_at, periods=n, freq="1min")
+
+    if not times.isin(bars.index).all():
+        return None, "missing 1-minute data"
+
+    candles = bars.loc[times]
+
+    # Assumed spread and slippage, not actual bid/ask quotes.
+    fill_offset = (
+        ASSUMED_SPREAD_TICKS + ENTRY_SLIPPAGE_TICKS
+    ) * tick
+
+    entry = (
+        float(candles.iloc[0]["open"])
+        + direction * fill_offset
+    )
+
+    risk_points = direction * (entry - stop)
+
+    if risk_points <= 0:
+        return None, "stop is on the wrong side of entry"
+
+    # ---------------------------------------------------
+    # POSITION SIZING — RISK BUDGET AND ESTIMATED MARGIN
+    # ---------------------------------------------------
+
+    per_contract_risk = (
+        (risk_points + EXIT_SLIPPAGE_TICKS * tick) * mult
+        + 2 * COMMISSION_PER_SIDE
+    )
+
+    per_trade_limit = equity * CONFIG.paper_risk_fraction
+
+    if per_contract_risk <= 0:
+        return None, "invalid stop risk"
+
+    risk_contracts = max(0, int(per_trade_limit // per_contract_risk))
+
+    # Micro futures: contract multiplier * index price = dollar notional.
+    # A fixed percentage is a proxy, NOT an official IBKR margin quote.
+    margin_per_contract = (
+        abs(entry) * mult * ESTIMATED_INITIAL_MARGIN_RATE
+    )
+
+    if margin_per_contract <= 0:
+        return None, "invalid margin estimate"
+
+    margin_contracts = max(0, int(available_margin // margin_per_contract))
+    contracts = min(risk_contracts, margin_contracts)
+
+    if contracts < 1:
+        reason = (
+            "insufficient risk budget"
+            if risk_contracts < 1
+            else "portfolio margin limit reached"
+        )
+        return None, reason
+
+    target = (
+        entry
+        + direction * CONFIG.reward_risk * risk_points
+    )
+    target = round(round(target / tick) * tick, 8)
+
+    # ---------------------------------------------------
+    # AUTOMATIC STOP, TARGET, AND TIME-BASED EXITS
+    # ---------------------------------------------------
+
+    exit_px = None
+    exit_bar_time = None
+    reason = None
+
+    for t, candle in candles.iterrows():
+        op = float(candle["open"])
+        hi = float(candle["high"])
+        lo = float(candle["low"])
+
+        stop_hit = (
+            lo <= stop if side == "LONG"
+            else hi >= stop
+        )
+
+        # Require price to move a tick beyond the target.
+        # This does not guarantee an actual limit-order fill.
+        target_hit = (
+            hi >= target + tick if side == "LONG"
+            else lo <= target - tick
+        )
+
+        # Conservative: stop takes priority if both are reached.
+        if stop_hit:
+            reason = "STOP"
+
+            raw = (
+                min(stop, op) if side == "LONG"
+                else max(stop, op)
+            )
+
+            exit_px = (
+                raw - direction * EXIT_SLIPPAGE_TICKS * tick
+            )
+
+        elif target_hit:
+            reason = "TARGET"
+            exit_px = target
+
+        else:
+            continue
+
+        exit_bar_time = t
+        break
+
+    if exit_px is None:
+        reason = "TIME LIMIT"
+        exit_bar_time = candles.index[-1]
+
+        exit_px = (
+            float(candles.iloc[-1]["close"])
+            - direction * EXIT_SLIPPAGE_TICKS * tick
+        )
+
+    # Exit timestamp approximated as end of 1-minute candle.
+    exit_complete = exit_bar_time + pd.Timedelta(minutes=1)
+
+    gross = (
+        direction
+        * (exit_px - entry)
+        * mult
+        * contracts
+    )
+
+    fees = 2 * COMMISSION_PER_SIDE * contracts
+
+    return {
+        "confirmation": signal["confirmation"],
+        "order_time": submitted,
+        "entry_time": filled_at,
+        "exit_time": exit_complete,
+        "side": side,
+        "contract": MICRO_SYMBOLS[symbol],
+        "symbol": symbol,
+        "contracts": contracts,
+        "entry": round(entry, 8),
+        "stop": stop,
+        "target": target,
+        "exit": round(exit_px, 8),
+        "reason": reason,
+        "pairs": ", ".join(signal["pairs"]),
+        "commissions": fees,
+        "net_pnl": gross - fees,
+        "planned_risk": per_contract_risk * contracts,
+        "reserved_margin": margin_per_contract * contracts,
+        "margin_per_contract": margin_per_contract
+    }, None
+
+
+# -------------------------------------------------------
+# 9C — PORTFOLIO MANAGER
+# -------------------------------------------------------
+
+def run_portfolio_backtest():
+
+    if "confirmed_signals" not in globals():
+        raise RuntimeError(
+            "Run Section 7 to create confirmed_signals first."
+        )
+
+    # Use saved 1-minute historical data
+    prices = {
+        symbol: saved_prices[(symbol, "1m")]
+        for symbol in ("ES", "NQ", "YM", "RTY")
+    }
+
+    # Remove exact duplicate signals.
+    seen = set()
+    candidates = []
+
+    for s in confirmed_signals:
+        key = (
+            s["confirmation"],
+            s["leader"],
+            s["side"],
+            s["stop"]
+        )
+
+        if key not in seen:
+            seen.add(key)
+            candidates.append(s)
+
+    candidates.sort(
+        key=lambda s: (
+            s["confirmation"],
+            s["leader"],
+            s["side"]
+        )
+    )
+
+    equity = CONFIG.initial_paper_equity
+    active = []
+    completed = []
+    reason_counts = defaultdict(int)
+    equity_track = [equity]
+    max_reserved_margin = 0.0
+
+    # Settle completed trades before processing another entry.
+    def settle_before(timestamp):
+        nonlocal equity, active
+
+        ending = sorted(
+            (
+                t for t in active
+                if t["exit_time"] <= timestamp
+            ),
+            key=lambda x: x["exit_time"]
+        )
+
+        for trade in ending:
+            equity += trade["net_pnl"]
+            equity_track.append(equity)
+            completed.append(trade)
+
+        ids = {id(t) for t in ending}
+        active = [
+            t for t in active
+            if id(t) not in ids
+        ]
+
+    # Process confirmed signals chronologically.
+    for s in candidates:
+
+        symbol = s["leader"]
+
+        arrival = (
+            s["confirmation"]
+            + pd.Timedelta(
+                minutes=5 + ORDER_DELAY_MINUTES
+            )
+        )
+
+        settle_before(arrival)
+
+        if symbol not in prices:
+            reason_counts["data unavailable"] += 1
+            continue
+
+        # Prevent simultaneous duplicate positions
+        # in the same futures market.
+        if any(t["symbol"] == symbol for t in active):
+            reason_counts[
+                "existing position in same market"
+            ] += 1
+            continue
+
+        # Margin capacity is portfolio-wide and accounts for active trades.
+        margin_limit = max(0.0, equity * MAX_MARGIN_UTILIZATION)
+        committed_margin = sum(t["reserved_margin"] for t in active)
+        available_margin = max(0.0, margin_limit - committed_margin)
+
+        trade, rejection = simulate_market_order(
+            s,
+            prices[symbol],
+            equity,
+            available_margin
+        )
+
+        if trade is None:
+            reason_counts[rejection] += 1
+            continue
+
+        active.append(trade)
+        max_reserved_margin = max(
+            max_reserved_margin,
+            committed_margin + trade["reserved_margin"]
+        )
+
+    # Settle any remaining positions.
+    settle_before(
+        pd.Timestamp.max.tz_localize("UTC")
+    )
+
+    results = (
+        pd.DataFrame(completed).sort_values("entry_time")
+        if completed else pd.DataFrame()
+    )
+
+    # ---------------------------------------------------
+    # 9D — DISPLAY BACKTEST RESULTS
+    # ---------------------------------------------------
+
+    print("========== SMT PORTFOLIO BACKTEST ==========")
+    print("Historical simulation — no real orders")
+    print("5-minute signals | 1-minute execution data")
+    print("1-minute modeled order delay")
+    print("Modeled spread, slippage, and commissions")
+    print(f"Risk per trade (Section 1): {CONFIG.paper_risk_fraction:.1%}")
+    print(f"Max combined margin usage: {MAX_MARGIN_UTILIZATION:.0%} of equity")
+    print(f"Margin model: {ESTIMATED_INITIAL_MARGIN_RATE:.0%} of notional (estimate)")
+    print("No fixed contract quantity cap")
+    print()
+
+    print(f"Confirmed signals: {len(candidates)}")
+    print(f"Simulated fills: {len(completed)}")
+    print(f"Not simulated: {dict(reason_counts)}")
+    print()
+
+    if results.empty:
+        print("No simulated trades with available data.")
+        return results
+
+    for _, t in results.iterrows():
+
+        print(
+            f"{t['entry_time']} | "
+            f"{t['side']} {t['contracts']} "
+            f"{t['contract']}"
+        )
+
+        print(
+            f"  Entry: {t['entry']:.2f} | "
+            f"Exit: {t['exit']:.2f} ({t['reason']})"
+        )
+
+        print(
+            f"  Net P&L: ${t['net_pnl']:+,.2f} | "
+            f"Pair(s): {t['pairs']}"
+        )
+
+        print()
+
+    # ---------------------------------------------------
+    # 9E — PERFORMANCE SUMMARY
+    # ---------------------------------------------------
+
+    total_wins = results.loc[
+        results.net_pnl > 0, "net_pnl"
+    ].sum()
+
+    total_losses = -results.loc[
+        results.net_pnl < 0, "net_pnl"
+    ].sum()
+
+    drawdown = (
+        pd.Series(equity_track)
+        - pd.Series(equity_track).cummax()
+    ).min()
+
+    print("========== PERFORMANCE SUMMARY ==========")
+
+    print(f"Trades: {len(results)}")
+    print(
+        f"Win rate: "
+        f"{(results.net_pnl > 0).mean():.1%}"
+    )
+
+    print(
+        f"Total net P&L: "
+        f"${results.net_pnl.sum():+,.2f}"
+    )
+
+    print(
+        f"Average net P&L: "
+        f"${results.net_pnl.mean():+,.2f}"
+    )
+
+    print(
+        f"Total commissions: "
+        f"${results.commissions.sum():,.2f}"
+    )
+
+    if total_losses > 0:
+        print(
+            f"Profit factor: "
+            f"{total_wins / total_losses:.2f}"
+        )
+    else:
+        print("Profit factor: N/A")
+
+    print(
+        f"Max realized drawdown: "
+        f"${drawdown:,.2f}"
+    )
+
+    print("\nPERFORMANCE BY PAIR(S):")
+
+    print(
+        results.groupby("pairs")["net_pnl"]
+        .agg(["count", "sum", "mean"])
+        .round(2)
+        .to_string()
+    )
+
+    print(
+        "\nAssumed fills only; "
+        "no exchange order-queue simulation."
+    )
+    print(f"Peak reserved estimated margin: ${max_reserved_margin:,.2f}")
+    print("Margin uses a static proxy, not broker historical requirements.")
+    print("Actual IBKR requirements can change; slippage may exceed estimates.")
+    print("=========================================")
+
+    return results
+
+
+# -------------------------------------------------------
+# 9F — RUN
+# -------------------------------------------------------
+
+backtest_results = run_portfolio_backtest()
