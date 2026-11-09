@@ -1,0 +1,66 @@
+"""Synthetic mechanical checks only; not a historical backtest."""
+from dataclasses import replace
+import unittest
+
+import numpy as np
+import pandas as pd
+
+
+class SMTTests(unittest.TestCase):
+    def test_no_current_candle_in_reference_high(self):
+        ix = pd.date_range("2026-10-19 09:30", periods=8, freq="5min", tz="America/New_York")
+        def bars(lead):
+            close = np.array([100., 100.1, 100.2, 100.3, 100.4, 100.5, 100.6, 100.7])
+            high = close + 0.1
+            if lead:
+                high[6] = 102.0
+            return pd.DataFrame({"open":close,"high":high,"low":close-0.1,"close":close},index=ix)
+        df = prepare_data(bars(True), bars(False))
+        self.assertAlmostEqual(df.loc[ix[6], "es_ref_high"], 100.6)
+        self.assertAlmostEqual(df.loc[ix[6], "es_high"], 102.0)
+        self.assertTrue(np.isnan(df.loc[ix[5], "es_ref_high"]))
+
+    def test_candidate_high_break_for_es_and_not_nq(self):
+        row = pd.Series({
+            "corr":0.9,"es_vol":0.001,"nq_vol":0.002,"relative_trend_z":0.,
+            "es_close":100.,"nq_close":200.,"es_ref_high":100.,"nq_ref_high":200.,
+            "es_ref_low":98.,"nq_ref_low":195.,"es_high":100.4,"nq_high":199.7,
+            "es_low":100.1,"nq_low":199.0})
+        t = pd.Timestamp("2026-10-19 10:15",tz="America/New_York")
+        result = _candidate(t, row, CONFIG)
+        self.assertIsNotNone(result)
+        self.assertEqual((result.side,result.leader),("SHORT","ES"))
+        self.assertGreater(result.divergence, 2.0)
+        # Large ongoing relative trend should reject the setup.
+        row["relative_trend_z"] = 4.0
+        self.assertIsNone(_candidate(t,row,CONFIG))
+
+    def test_make_paper_plan_is_not_order(self):
+        t = pd.Timestamp("2026-10-19 10:15",tz="America/New_York")
+        signal = Signal(t,"SHORT","ES","NQ",2.5,.9,0.,20000.,6000.)
+        c = Confirmation(t, signal, 6002.0)
+        order = make_paper_order_plan(c, 6000.0)
+        self.assertEqual(order.instrument,"MES")
+        self.assertEqual(order.contracts,5)
+        self.assertEqual(order.target,5996.0)
+        self.assertEqual(order.planned_dollar_risk,50.0)
+        self.assertIsNone(make_paper_order_plan(c, 6003.0))
+
+    def test_confirmation_and_lagger_catch_up(self):
+        t = pd.date_range("2026-10-19 10:00", periods=3, freq="5min",tz="America/New_York")
+        rows = pd.DataFrame(index=t)
+        for col in ("es","nq"):
+            rows[f"{col}_close"]=[100.,98.5,98.]
+            rows[f"{col}_high"]=[101.,100.,99.]
+            rows[f"{col}_low"]=[99.,98.,97.]
+        rows["nq_high"]=[99.,99.,99.]
+        # Inject just a single valid candidate at bar 0 by overriding features.
+        from unittest.mock import patch
+        sig = Signal(t[0],"SHORT","ES","NQ",3.,.9,0.,101.,101.)
+        # Notebook adaptation: the strategy is in this notebook, not a strategy.py module.
+        with patch.dict(scan_signals.__globals__, {"_candidate": lambda time,row,cfg: sig if time==t[0] else None}):
+            cand, conf = scan_signals(rows)
+        self.assertEqual(len(cand),1)
+        self.assertEqual(len(conf),1)
+        self.assertEqual(conf[0].time,t[1])
+        self.assertAlmostEqual(conf[0].stop_level,101.5)
