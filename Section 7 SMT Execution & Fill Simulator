@@ -145,3 +145,225 @@ def collect_confirmed_signals():
     )
 
 confirmed_signals = collect_confirmed_signals()
+
+# -------------------------------------------------------
+# 7C — SIMULATE ENTRY AND EXIT FILLS
+# -------------------------------------------------------
+
+def simulate_fill(signal):
+    bars = signal["bars"]
+    confirmation = signal["confirmation"]
+    side = signal["side"]
+    leader = signal["leader"]
+
+    tick = TICK_SIZE[leader]
+    multiplier = MICRO_MULTIPLIER[leader]
+    stop = signal["stop"]
+
+    # Confirmation candle is timestamped at OPEN.
+    # It closes five minutes later.
+    entry_time = confirmation + pd.Timedelta(minutes=5)
+
+    # Reject entries that cannot complete a 30-minute hold by 4 PM.
+    session_open = pd.Timestamp("09:30").time()
+    last_entry = pd.Timestamp("15:30").time()
+
+    if not session_open <= entry_time.time() <= last_entry:
+        return None
+    
+
+    if entry_time not in bars.index:
+        return None
+
+    if entry_time.date() != confirmation.date():
+        return None
+
+    # The market order is assumed to fill at the
+    # next candle open with adverse slippage.
+    market_open = float(bars.loc[entry_time, "open"])
+
+    if side == "LONG":
+        entry = market_open + ENTRY_SLIPPAGE_TICKS * tick
+        risk_points = entry - stop
+    else:
+        entry = market_open - ENTRY_SLIPPAGE_TICKS * tick
+        risk_points = stop - entry
+
+    if risk_points <= 0:
+        return None
+
+    # Existing risk limit and contract cap.
+    risk_budget = CONFIG.initial_paper_equity * CONFIG.paper_risk_fraction
+    contracts = int(risk_budget // (risk_points * multiplier))
+
+    if contracts < 1:
+        return None
+
+    if side == "LONG":
+        target = entry + CONFIG.reward_risk * risk_points
+    else:
+        target = entry - CONFIG.reward_risk * risk_points
+
+    target = round(round(target / tick) * tick, 8)
+
+    # Check at most 6 candles, including entry candle.
+    future = bars.loc[entry_time:]
+    future = future[future.index.date == entry_time.date()]
+    future = future.head(CONFIG.max_holding_bars)
+
+    if future.empty:
+        return None
+
+    exit_time = None
+    exit_price = None
+    exit_reason = None
+
+    for t, candle in future.iterrows():
+        high = float(candle["high"])
+        low = float(candle["low"])
+        candle_open = float(candle["open"])
+
+        if side == "LONG":
+            hit_stop = low <= stop
+            hit_target = high >= target
+        else:
+            hit_stop = high >= stop
+            hit_target = low <= target
+
+        if hit_stop:
+            exit_time = t
+            exit_reason = "STOP"
+
+            # A stop can fill worse than its trigger.
+            if side == "LONG":
+                raw_exit = min(stop, candle_open)
+                exit_price = raw_exit - EXIT_SLIPPAGE_TICKS * tick
+            else:
+                raw_exit = max(stop, candle_open)
+                exit_price = raw_exit + EXIT_SLIPPAGE_TICKS * tick
+
+            break
+
+        if hit_target:
+            exit_time = t
+            exit_reason = "TARGET"
+
+            # Limit target assumed filled at its limit price.
+            # Touching a limit does NOT guarantee a real fill.
+            exit_price = target
+            break
+
+    if exit_time is None:
+        # If fewer than 6 completed candles are available,
+        # the exit cannot yet be established.
+        if len(future) < CONFIG.max_holding_bars:
+            return {
+                **signal,
+                "entry_time": entry_time,
+                "entry": entry,
+                "contracts": contracts,
+                "target": target,
+                "exit_time": None,
+                "exit": None,
+                "exit_reason": "OPEN / INCOMPLETE"
+            }
+
+        last = future.iloc[-1]
+        exit_time = future.index[-1]
+        exit_reason = "TIME LIMIT"
+
+        if side == "LONG":
+            exit_price = (
+                float(last["close"])
+                - EXIT_SLIPPAGE_TICKS * tick
+            )
+        else:
+            exit_price = (
+                float(last["close"])
+                + EXIT_SLIPPAGE_TICKS * tick
+            )
+
+    return {
+        **signal,
+        "entry_time": entry_time,
+        "entry": round(entry, 8),
+        "contracts": contracts,
+        "target": target,
+        "exit_time": exit_time,
+        "exit": round(exit_price, 8),
+        "exit_reason": exit_reason
+    }
+
+
+# -------------------------------------------------------
+# 7D — DISPLAY SIMULATED FILLS ONLY
+# -------------------------------------------------------
+
+def run_execution_simulator():
+    signals = confirmed_signals
+    simulations = []
+
+    print("========== SMT EXECUTION SIMULATOR ==========")
+    print("Historical, hypothetical market-order fills")
+    print("No actual orders. No P&L calculated.")
+    print(
+        f"Entry slippage: {ENTRY_SLIPPAGE_TICKS} tick | "
+        f"Stop/time-exit slippage: {EXIT_SLIPPAGE_TICKS} tick"
+    )
+    print(
+        f"Assumed commission: "
+        f"${COMMISSION_PER_SIDE:.2f} per contract per side"
+    )
+    print()
+
+    for signal in signals:
+        trade = simulate_fill(signal)
+
+        if trade is None:
+            continue
+
+        simulations.append(trade)
+
+        print(
+            f"{trade['entry_time']} | "
+            f"{trade['side']} {trade['contracts']} "
+            f"{trade['contract']}"
+        )
+
+        print(
+            f"  Simulated entry: {trade['entry']:.2f} | "
+            f"Stop: {trade['stop']:.2f} | "
+            f"Target: {trade['target']:.2f}"
+        )
+
+        if trade["exit"] is None:
+            print("  Exit: Not established — insufficient completed data")
+        else:
+            # Exit timestamp identifies the candle, not
+            # the exact intrabar execution time.
+            print(
+                f"  Simulated exit: {trade['exit']:.2f} | "
+                f"{trade['exit_reason']} | "
+                f"Exit candle: {trade['exit_time']}"
+            )
+
+        print(f"  Signal pair(s): {', '.join(trade['pairs'])}")
+        print()
+
+    print("=============================================")
+    print(f"Confirmed unique signals: {len(signals)}")
+    print(f"Simulated entries: {len(simulations)}")
+    print(
+        "Unfilled/unavailable simulations: "
+        f"{len(signals) - len(simulations)}"
+    )
+
+    return simulations
+
+
+# -------------------------------------------------------
+# 7E — RUN
+# -------------------------------------------------------
+
+simulated_trades = run_execution_simulator()
+
