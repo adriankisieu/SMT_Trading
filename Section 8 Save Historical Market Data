@@ -1,0 +1,192 @@
+
+# =======================================================
+# SECTION 8 — SAVE HISTORICAL MARKET DATA
+# ES, NQ, YM, RTY | 1-minute and 5-minute candles
+# =======================================================
+
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+import yfinance as yf
+
+# Create a permanent, timestamped snapshot folder.
+snapshot_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+DATA_FOLDER = Path("SMT_Data") / snapshot_time
+DATA_FOLDER.mkdir(parents=True, exist_ok=True)
+
+SYMBOLS = {
+    "ES": "ES=F",
+    "NQ": "NQ=F",
+    "YM": "YM=F",
+    "RTY": "RTY=F"
+}
+
+# Request smaller windows to avoid Yahoo interval limits.
+DOWNLOAD_SETTINGS = {
+    "1m": {"lookback_days": 30, "chunk_days": 6},
+    "5m": {"lookback_days": 59, "chunk_days": 20}
+}
+
+
+# -------------------------------------------------------
+# 8A — DOWNLOAD HISTORICAL CANDLES
+# -------------------------------------------------------
+
+def download_history(ticker, interval, lookback_days, chunk_days):
+
+    end_time = pd.Timestamp.now(tz="America/New_York")
+    start_time = end_time - pd.Timedelta(days=lookback_days)
+
+    frames = []
+    failures = []
+
+    current = start_time
+
+    while current < end_time:
+        chunk_end = min(
+            current + pd.Timedelta(days=chunk_days),
+            end_time
+        )
+
+        try:
+            frame = yf.download(
+                ticker,
+                start=current.to_pydatetime(),
+                end=chunk_end.to_pydatetime(),
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                multi_level_index=False
+            )
+
+            if frame is not None and not frame.empty:
+
+                if isinstance(frame.columns, pd.MultiIndex):
+                    frame.columns = frame.columns.get_level_values(0)
+
+                frame.columns = [
+                    str(c).lower() for c in frame.columns
+                ]
+
+                frame = frame[
+                    ["open", "high", "low", "close"]
+                ].copy()
+
+                if frame.index.tz is None:
+                    raise ValueError("Missing timezone")
+
+                frame.index = frame.index.tz_convert(
+                    "America/New_York"
+                )
+
+                frames.append(frame)
+
+            else:
+                failures.append(
+                    f"{current.date()} to {chunk_end.date()}"
+                )
+
+        except Exception as exc:
+            failures.append(
+                f"{current.date()} to {chunk_end.date()}: {exc}"
+            )
+
+        current = chunk_end
+
+    if not frames:
+        return pd.DataFrame(), failures
+
+    result = pd.concat(frames)
+    result = result[
+        ~result.index.duplicated(keep="last")
+    ].sort_index()
+
+    # Discard any incomplete final candle.
+    minutes = 1 if interval == "1m" else 5
+
+    cutoff = pd.Timestamp.now(tz="America/New_York")
+
+    result = result[
+        result.index + pd.Timedelta(minutes=minutes) <= cutoff
+    ]
+
+    # Use the same regular trading hours as the strategy.
+    result = result.between_time("09:30", "15:59")
+
+    result.index.name = "timestamp"
+
+    return result, failures
+
+
+# -------------------------------------------------------
+# 8B — SAVE ALL FOUR MARKETS
+# -------------------------------------------------------
+
+manifest = []
+
+for interval, settings in DOWNLOAD_SETTINGS.items():
+
+    print(f"\n========== {interval} DATA ==========")
+
+    for symbol, ticker in SYMBOLS.items():
+
+        frame, failures = download_history(
+            ticker,
+            interval,
+            settings["lookback_days"],
+            settings["chunk_days"]
+        )
+
+        if frame.empty:
+            print(f"{symbol}: NO DATA")
+            continue
+
+        filename = DATA_FOLDER / f"{symbol}_{interval}.csv"
+
+        frame.to_csv(filename)
+
+        first = frame.index.min()
+        last = frame.index.max()
+
+        manifest.append({
+            "symbol": symbol,
+            "interval": interval,
+            "rows": len(frame),
+            "first_timestamp": str(first),
+            "last_timestamp": str(last),
+            "failed_windows": len(failures),
+            "file": str(filename)
+        })
+
+        print(
+            f"{symbol}: {len(frame):,} candles | "
+            f"{first.date()} to {last.date()}"
+        )
+
+        if failures:
+            print(
+                f"  Warning: {len(failures)} download "
+                f"windows returned no data or failed"
+            )
+            for failure in failures:
+                print(f"    {failure}")
+
+
+# -------------------------------------------------------
+# 8C — SAVE DATA MANIFEST
+# -------------------------------------------------------
+
+manifest_df = pd.DataFrame(manifest)
+
+if not manifest_df.empty:
+    manifest_df.to_csv(
+        DATA_FOLDER / "manifest.csv",
+        index=False
+    )
+
+print("\n========== SNAPSHOT COMPLETE ==========")
+print(f"Folder: {DATA_FOLDER.resolve()}")
+print(f"Files saved: {len(manifest)}")
+print("Existing historical snapshots are preserved.")
+print("=======================================")
