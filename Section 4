@@ -1,0 +1,87 @@
+"""Build features and display SMT alerts; intentionally DOES NOT backtest."""
+import argparse
+import pandas as pd
+
+
+def read_csv(filename: str) -> pd.DataFrame:
+    frame = pd.read_csv(filename)
+    if "timestamp" not in frame.columns:
+        raise ValueError(f"{filename} must contain timestamp,open,high,low,close")
+    ts = frame["timestamp"].astype(str)
+    if not ts.str.contains(r"(?:Z|[+-]\d{2}:\d{2})$", regex=True).all():
+        raise ValueError("CSV timestamps must include a timezone offset (e.g. -04:00 or Z)")
+    frame["timestamp"] = pd.to_datetime(ts, utc=True)
+    frame = frame.set_index("timestamp").sort_index()
+    return frame
+
+
+def explain_setup(signal, df, confirmed, cfg=CONFIG):
+    """Explain a historical scanner alert without placing or evaluating trades."""
+    matches = [c for c in confirmed if c.signal.time == signal.time]
+    if matches:
+        return f"CONFIRMED at {matches[0].time} | stop {matches[0].stop_level:.2f} | entry planned at next candle open"
+
+    loc = df.index.get_loc(signal.time)
+    extreme = signal.extreme
+    for offset in range(1, cfg.confirmation_bars + 1):
+        idx = loc + offset
+        if idx >= len(df):
+            return "PENDING — not enough completed candles yet"
+        prior_time, timestamp = df.index[idx - 1], df.index[idx]
+        if timestamp - prior_time != pd.Timedelta(minutes=5) or timestamp.date() != prior_time.date():
+            return "EXPIRED — trading session ended or candle gap"
+        row, previous = df.iloc[idx], df.iloc[idx - 1]
+        leader, lagger = signal.leader.lower(), signal.lagger.lower()
+        if signal.side == "SHORT":
+            extreme = max(extreme, float(row[f"{leader}_high"]))
+            caught_up = row[f"{lagger}_high"] >= signal.lagger_reference
+            confirmed_now = row[f"{leader}_close"] < previous[f"{leader}_low"]
+        else:
+            extreme = min(extreme, float(row[f"{leader}_low"]))
+            caught_up = row[f"{lagger}_low"] <= signal.lagger_reference
+            confirmed_now = row[f"{leader}_close"] > previous[f"{leader}_high"]
+        if caught_up:
+            return f"INVALIDATED — {signal.lagger} caught up at {timestamp}"
+        # A signal cannot be confirmed at the final RTH candle.
+        if confirmed_now and timestamp.time() < pd.Timestamp("15:55").time():
+            return "Confirmation condition met, but no scanner confirmation (inspect logic)"
+    return f"EXPIRED — no reversal confirmation within {cfg.confirmation_bars} candles"
+
+
+def main(cli_args=None) -> None:
+    parser = argparse.ArgumentParser(description="SMT signal scanner (no backtests/orders)")
+    parser.add_argument("--source", choices=("yahoo", "csv"), default="yahoo")
+    parser.add_argument("--es", help="ES.csv with timezone-aware timestamps")
+    parser.add_argument("--nq", help="NQ.csv with timezone-aware timestamps")
+    # Notebook adaptation: don't parse Jupyter's own command-line arguments.
+    args = parser.parse_args([] if cli_args is None else cli_args)
+    if args.source == "yahoo":
+        es, nq = fetch_yahoo()
+    else:
+        if not args.es or not args.nq:
+            parser.error("--source csv requires both --es and --nq")
+        es, nq = read_csv(args.es), read_csv(args.nq)
+
+    df = prepare_data(es, nq, CONFIG)
+    candidates, confirmed = scan_signals(df, CONFIG)
+    print("SMT SIGNAL SCANNER -- no trades placed, no backtest performed")
+    print("Yahoo quotes may be delayed; do not use this as a live execution feed.")
+    print(f"Aligned completed RTH candles: {len(df)} | Latest: {df.index[-1]}")
+    print(f"Setup alerts: {len(candidates)} | Confirmations: {len(confirmed)}")
+    print("\nALL SMT SETUPS (potential trades; none placed):")
+    for s in candidates:
+        instrument = "MES" if s.leader == "ES" else "MNQ"
+        print(f"{s.time} | Proposed: {s.side} {instrument} ({s.leader} leads, {s.lagger} lags) "
+              f"| divergence={s.divergence:.2f} corr={s.correlation:.2f}")
+        print(f"    {explain_setup(s, df, confirmed)}")
+    if not candidates:
+        print("No setups found.")
+    print("\nMost recent confirmations:")
+    for c in confirmed[-10:]:
+        s = c.signal
+        print(f"{c.time}  {s.side} {s.leader}  "
+              f"D={s.divergence:.2f}  corr={s.correlation:.2f} "
+              f"trendZ={s.relative_trend_z:.2f} "
+              f"stop={c.stop_level:.2f}  ENTRY: next candle open")
+    if not confirmed:
+        print("None. This can be normal with strict settings or insufficient warmup data.")
