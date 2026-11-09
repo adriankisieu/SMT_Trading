@@ -1,0 +1,28 @@
+"""Change the strategy's starting assumptions here (not optimized)."""
+from dataclasses import dataclass
+import databento as db
+
+
+@dataclass(frozen=True)
+class Config:
+    es_ticker: str = "ES=F"
+    nq_ticker: str = "NQ=F"
+    interval: str = "5m"
+    previous_high_low_bars: int = 6       # 6 x 5 min = prior 30 minutes
+    relationship_days: int = 20          # approximately 20 US cash sessions
+    bars_per_day: int = 78               # RTH: 9:30 through 15:55 New York
+    correlation_floor: float = 0.70
+    relative_trend_days: int = 5
+    relative_trend_max_z: float = 2.0    # filter sustained beta-adjusted drift
+    divergence_min: float = 2.0          # volatility-normalized units
+    min_leader_breakout: float = 0.25    # new high/low must exceed ref by 0.25 sigma
+    confirmation_bars: int = 3          # confirmation within 15 minutes
+    stop_buffer_ticks: int = 2          # ES/NQ minimum tick size 0.25
+    reward_risk: float = 2.0
+    initial_paper_equity: float = 100_000.0
+    paper_risk_fraction: float = 0.02
+    max_holding_bars: int = 6           # 30 minutes, for later execution engine
+    regular_session_only: bool = True
+
+
+CONFIG = Config()
