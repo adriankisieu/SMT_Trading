@@ -1,0 +1,147 @@
+
+# SECTION 7 — SMT EXECUTION & FILL SIMULATOR
+# Six independent pairs. Historical simulation only.
+# NO broker orders. NO live trading. NO P&L calculation.
+
+from itertools import combinations
+import pandas as pd
+
+YAHOO_SYMBOLS = {
+    "ES": "ES=F", "NQ": "NQ=F",
+    "YM": "YM=F", "RTY": "RTY=F"
+}
+
+MICRO_SYMBOLS = {
+    "ES": "MES", "NQ": "MNQ",
+    "YM": "MYM", "RTY": "M2K"
+}
+
+TICK_SIZE = {
+    "ES": 0.25, "NQ": 0.25,
+    "YM": 1.0, "RTY": 0.10
+}
+
+MICRO_MULTIPLIER = {
+    "ES": 5.0, "NQ": 2.0,
+    "YM": 0.50, "RTY": 5.0
+}
+
+ENTRY_SLIPPAGE_TICKS = 1
+EXIT_SLIPPAGE_TICKS = 1
+
+# Example cost assumption, not an actual broker quote.
+COMMISSION_PER_SIDE = 2.00
+
+
+# -------------------------------------------------------
+# 7A — DOWNLOAD MARKET DATA
+# -------------------------------------------------------
+
+def fetch_added_index(symbol, days=45):
+    import yfinance as yf
+
+    start = (
+        pd.Timestamp.now(tz="America/New_York")
+        - pd.Timedelta(days=days)
+    ).strftime("%Y-%m-%d")
+
+    frame = yf.download(
+        YAHOO_SYMBOLS[symbol],
+        interval=CONFIG.interval,
+        start=start,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+        multi_level_index=False
+    )
+
+    if frame is None or frame.empty:
+        raise RuntimeError(f"No Yahoo data for {symbol}")
+
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = frame.columns.get_level_values(0)
+
+    frame.columns = [str(c).lower() for c in frame.columns]
+    frame = frame[["open", "high", "low", "close"]].copy()
+
+    if frame.index.tz is None:
+        raise ValueError(f"{symbol}: missing timezone")
+
+    frame.index = frame.index.tz_convert("America/New_York")
+    frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+
+    cutoff = (
+        pd.Timestamp.now(tz="America/New_York")
+        - pd.Timedelta(seconds=30)
+    )
+
+    return frame[
+        frame.index + pd.Timedelta(minutes=5) <= cutoff
+    ]
+
+
+# -------------------------------------------------------
+# 7B — IDENTIFY CONFIRMED SIGNALS
+# -------------------------------------------------------
+
+def collect_confirmed_signals():
+    # Use fixed historical data instead of downloading again.
+    prices = {
+    symbol: saved_prices[(symbol, "5m")]
+    for symbol in ("ES", "NQ", "YM", "RTY")
+}
+
+    signals = {}
+
+    for left, right in combinations(YAHOO_SYMBOLS, 2):
+        pair = f"{left}/{right}"
+
+        if left not in prices or right not in prices:
+            print(f"SKIPPED {pair}: missing data")
+            continue
+
+        try:
+            df = prepare_data(prices[left], prices[right], CONFIG)
+            _, confirmations = scan_signals(df, CONFIG)
+        except (ValueError, RuntimeError) as exc:
+            print(f"SKIPPED {pair}: {exc}")
+            continue
+
+        for c in confirmations:
+            leader = left if c.signal.leader == "ES" else right
+            side = c.signal.side
+            tick = TICK_SIZE[leader]
+
+            direction = 1 if side == "SHORT" else -1
+
+            # Correct the original ES/NQ two-tick stop
+            # for the actual leader's tick size.
+            stop = c.stop_level + (
+                direction * CONFIG.stop_buffer_ticks
+                * (tick - 0.25)
+            )
+
+            # Normalize to the futures tick grid.
+            stop = round(round(stop / tick) * tick, 8)
+
+            key = (c.time, leader, side, stop)
+
+            if key not in signals:
+                signals[key] = {
+                    "confirmation": c.time,
+                    "leader": leader,
+                    "contract": MICRO_SYMBOLS[leader],
+                    "side": side,
+                    "stop": stop,
+                    "pairs": [],
+                    "bars": prices[leader]
+                }
+
+            signals[key]["pairs"].append(pair)
+
+    return sorted(
+        signals.values(),
+        key=lambda x: x["confirmation"]
+    )
+
+confirmed_signals = collect_confirmed_signals()
