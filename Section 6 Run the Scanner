@@ -1,0 +1,251 @@
+
+# =======================================================
+# SECTION 6D — LOAD AND VALIDATE DATABENTO HISTORICAL DATA
+# =======================================================
+
+from pathlib import Path
+import pandas as pd
+
+MARKETS = ["ES", "NQ", "YM", "RTY"]
+INTERVALS = ["1m", "5m"]
+
+# Folder created in our separate Databento notebook.
+# If necessary, replace this path with the folder's
+# exact location printed by Path(...).resolve().
+DATA_FOLDER = Path("/Users/adikisieu/SMT_Databento_Data")
+
+if not DATA_FOLDER.is_dir():
+    raise FileNotFoundError(
+        f"Databento folder not found: {DATA_FOLDER.resolve()}\n"
+        "Set DATA_FOLDER to the full path of the folder "
+        "created in your separate Databento notebook."
+    )
+
+FILES = {
+    "1m": DATA_FOLDER / "smt_1min.pkl",
+    "5m": DATA_FOLDER / "smt_5min.pkl"
+}
+
+saved_prices = {}
+validation_results = []
+
+
+# -------------------------------------------------------
+# LOAD BOTH DATABENTO FILES
+# -------------------------------------------------------
+
+for interval in INTERVALS:
+
+    filename = FILES[interval]
+
+    if not filename.exists():
+        raise FileNotFoundError(
+            f"Missing Databento file: {filename}"
+        )
+
+    raw = pd.read_pickle(filename)
+
+    required = {
+        "symbol", "open", "high", "low", "close"
+    }
+
+    missing = required - set(raw.columns)
+
+    if missing:
+        raise ValueError(
+            f"{filename}: missing columns {missing}"
+        )
+
+    if not isinstance(raw.index, pd.DatetimeIndex):
+        raise ValueError(
+            f"{filename}: expected a DatetimeIndex"
+        )
+
+    if raw.index.tz is None:
+        raise ValueError(
+            f"{filename}: timestamps must be timezone-aware"
+        )
+
+    raw = raw.copy()
+
+    raw.index = raw.index.tz_convert(
+        "America/New_York"
+    )
+
+    raw = raw.sort_index()
+
+    # ---------------------------------------------------
+    # SEPARATE THE FOUR FUTURES MARKETS
+    # ---------------------------------------------------
+
+    for market in MARKETS:
+
+        symbol = f"{market}.v.0"
+
+        df = raw.loc[
+            raw["symbol"] == symbol,
+            ["open", "high", "low", "close"]
+        ].copy()
+
+        if df.empty:
+            raise ValueError(
+                f"No {interval} data for {symbol}"
+            )
+
+        df = df.apply(
+            pd.to_numeric,
+            errors="coerce"
+        )
+
+        df = df.sort_index()
+
+        # ------------------------------------------------
+        # VALIDATE DATA QUALITY
+        # ------------------------------------------------
+
+        duplicates = int(
+            df.index.duplicated().sum()
+        )
+
+        invalid_prices = (
+            df.isna().any(axis=1)
+            | (df <= 0).any(axis=1)
+            | (
+                df["high"]
+                < df[["open", "close", "low"]].max(axis=1)
+            )
+            | (
+                df["low"]
+                > df[["open", "close", "high"]].min(axis=1)
+            )
+        )
+
+        bad_rows = int(invalid_prices.sum())
+
+        expected_step = pd.Timedelta(
+            minutes=1 if interval == "1m" else 5
+        )
+
+        timestamps = df.index.to_series()
+
+        same_day = timestamps.dt.date.eq(
+            timestamps.shift(1).dt.date
+        )
+
+        gaps = int(
+            (
+                timestamps.diff().gt(expected_step)
+                & same_day
+            ).sum()
+        )
+
+        # Preserve the original saved_prices interface.
+        saved_prices[(market, interval)] = df
+
+        validation_results.append({
+            "Market": market,
+            "Interval": interval,
+            "Candles": len(df),
+            "Duplicates": duplicates,
+            "Invalid prices": bad_rows,
+            "Intraday gaps": gaps,
+            "First": df.index.min().date(),
+            "Last": df.index.max().date()
+        })
+
+
+# -------------------------------------------------------
+# DISPLAY VALIDATION SUMMARY
+# -------------------------------------------------------
+
+validation_df = pd.DataFrame(validation_results)
+
+print("========== DATABENTO DATA VALIDATION ==========")
+print(validation_df.to_string(index=False))
+
+print("\n========== CROSS-MARKET ALIGNMENT ==========")
+
+for interval in INTERVALS:
+
+    common = saved_prices[
+        (MARKETS[0], interval)
+    ].index
+
+    for market in MARKETS[1:]:
+        common = common.intersection(
+            saved_prices[(market, interval)].index
+        )
+
+    print(
+        f"{interval}: {len(common):,} timestamps "
+        "shared by all four markets"
+    )
+
+print("\n========== VALIDATION RESULT ==========")
+
+if (
+    validation_df["Duplicates"].sum() == 0
+    and validation_df["Invalid prices"].sum() == 0
+    and validation_df["Intraday gaps"].sum() == 0
+):
+    print("Basic data validation PASSED.")
+else:
+    print("WARNING: Data quality issues detected.")
+
+print("Data source: Databento")
+print("Futures: ES, NQ, YM, RTY")
+print("Session: 09:30–16:00 New York time")
+print("Historical data available in saved_prices.")
+
+
+# =======================================================
+# SECTION 6E — INSPECT HISTORICAL DATA GAPS
+# =======================================================
+
+for interval in INTERVALS:
+
+    print(f"\n========== {interval} GAPS ==========")
+
+    expected = pd.Timedelta(
+        minutes=1 if interval == "1m" else 5
+    )
+
+    for market in MARKETS:
+
+        df = saved_prices[(market, interval)]
+        timestamps = df.index.to_series()
+
+        same_day = timestamps.dt.date.eq(
+            timestamps.shift(1).dt.date
+        )
+
+        gap_mask = (
+            timestamps.diff().gt(expected)
+            & same_day
+        )
+
+        gaps = timestamps[gap_mask]
+
+        if gaps.empty:
+            print(f"{market}: No intraday gaps")
+            continue
+
+        for current_time in gaps:
+
+            position = df.index.get_loc(
+                current_time
+            )
+
+            previous_time = df.index[
+                position - 1
+            ]
+
+            missing = int(
+                (current_time - previous_time)
+                / expected
+            ) - 1
+
+            print(
+                f"{market}: {missing} missing candles | "
+                f"{previous_time} → {current_time}"
+            )
