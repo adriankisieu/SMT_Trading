@@ -1,6 +1,6 @@
 # SMT Divergence Trading Strategy
 
-**Status: Work in Progress**
+**Status: Work in Progress (no alpha found)**
 
 A quantitative trading research project focused on identifying and evaluating Smart Money Technique (SMT) divergences across correlated equity index futures. The goal is to develop a systematic, data-driven trading strategy through historical backtesting, realistic execution modeling, and iterative optimization.
 
